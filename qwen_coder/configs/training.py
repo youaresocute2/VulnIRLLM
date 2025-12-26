@@ -10,7 +10,7 @@ class train_config:
     # =====================================================
     model_name: str = "/home/daiwenju/Qwen2.5-Coder-7B-Instruct"
     output_root: str = "vulnirllm_qwen7b"
-    stage: str = "stage1"  # stage1 | stage2_1 | stage2_2
+    stage: str = "aux_pretrain"  # aux_pretrain | task1_finetune | joint_finetune
 
     # 数据路径
     train_data_path: str = "./dataset/primevul_train.jsonl"
@@ -50,10 +50,15 @@ class train_config:
     lora_r: int = 32
     lora_alpha: int = 64
     lora_dropout: float = 0.05
-    target_modules: List[str] = field(default_factory=lambda: [
+    joint_lora_r: int = 8
+    joint_lora_alpha: int = 16
+    lora_target_modules: List[str] = field(default_factory=lambda: [
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj"
     ])
+    aux_adapter_name: str = "aux_tasks"
+    task1_adapter_name: str = "verdict_evidence"
+    joint_adapter_name: str = "joint_refinement"
 
     # =====================================================
     # 5. 其他配置
@@ -63,6 +68,9 @@ class train_config:
     fp16: bool = False
     gradient_checkpointing: bool = True
     num_workers_dataloader: int = 0
+    device: str = "cuda:0"
+    run_pipeline: bool = False
+    eval_after_stage: bool = True
 
     # =====================================================
     # 6. 剪枝配置 (Stage1建议更大窗口)
@@ -84,31 +92,31 @@ class train_config:
             self.output_dir = self.output_root
 
         # 2. 根据 Stage 自动配置 Epoch, Output Dir, 和 Learning Rate
-        if self.stage == "stage1":
+        if self.stage == "aux_pretrain":
             self.num_train_epochs = 7
             self.lr = 2e-5
-            self.output_dir = os.path.join(self.output_root, "stage1_baseline")
+            self.output_dir = os.path.join(self.output_root, "stage1_aux_tasks")
 
-            # Stage1默认更大剪枝窗口（允许保留更多关键上下文）
+            # 辅助任务更大的剪枝窗口，保留更多上下文
             if self.prune_window <= 0: self.prune_window = 12
             if self.prune_keep_head <= 0: self.prune_keep_head = 20
             if self.prune_keep_tail <= 0: self.prune_keep_tail = 15
 
-        elif self.stage == "stage2_1":
-            if self.prune_window <= 0: self.prune_window = 3
-            if self.prune_keep_head <= 0: self.prune_keep_head = 8
-            if self.prune_keep_tail <= 0: self.prune_keep_tail = 6
+        elif self.stage == "task1_finetune":
+            if self.prune_window <= 0: self.prune_window = 6
+            if self.prune_keep_head <= 0: self.prune_keep_head = 10
+            if self.prune_keep_tail <= 0: self.prune_keep_tail = 8
             self.num_train_epochs = 4
             self.lr = 2e-5
-            self.output_dir = os.path.join(self.output_root, "stage2_1_expert")
+            self.output_dir = os.path.join(self.output_root, "stage2_task1")
 
-        elif self.stage == "stage2_2":
-            if self.prune_window <= 0: self.prune_window = 3
-            if self.prune_keep_head <= 0: self.prune_keep_head = 8
-            if self.prune_keep_tail <= 0: self.prune_keep_tail = 6
-            self.num_train_epochs = 7
-            self.lr = 2e-5  # 如果后续发现融合困难，可在此处降级为 2e-5
-            self.output_dir = os.path.join(self.output_root, "stage2_2_fusion")
+        elif self.stage == "joint_finetune":
+            if self.prune_window <= 0: self.prune_window = 6
+            if self.prune_keep_head <= 0: self.prune_keep_head = 10
+            if self.prune_keep_tail <= 0: self.prune_keep_tail = 8
+            self.num_train_epochs = 3
+            self.lr = 1e-5
+            self.output_dir = os.path.join(self.output_root, "stage3_joint")
 
         else:
             raise ValueError(f"Unknown stage={self.stage}")
