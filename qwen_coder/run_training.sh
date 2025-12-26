@@ -24,6 +24,7 @@ LOG_FILE="./logs/train_run_${CURRENT_TIME}.log"
 echo "--> Launching Training..."
 echo "--> Configuration is loaded strictly from: qwen_coder/configs/training.py"
 echo "--> Logs will be saved to: $LOG_FILE"
+echo "--> To run the full single-GPU pipeline sequentially, pass --run_pipeline to finetuning.py"
 
 # 3. 执行 nohup
 nohup python -m qwen_coder.finetuning > "$LOG_FILE" 2>&1 &

@@ -78,17 +78,28 @@ class VulnirLLMDataset(Dataset):
         self.tokenizer = tokenizer
         self.split = partition
 
-        self.stage = getattr(dataset_config, "stage", "stage1")
+        # Normalize stage naming so the dataset can be reused for both
+        # the legacy pipeline (stage1/stage2_1/stage2_2) and the new
+        # single-GPU, three-stage flow (aux_pretrain/task1_finetune/joint_finetune).
+        self.stage = getattr(dataset_config, "stage", "aux_pretrain")
+        if self.stage == "stage2_1":
+            self.stage = "aux_pretrain"
+        elif self.stage == "stage1":
+            self.stage = "task1_finetune"
+        elif self.stage == "stage2_2":
+            self.stage = "joint_finetune"
         self.max_total_tokens = getattr(dataset_config, "context_length", 6144)
         self.total_processed = 0
 
         # -------------------------------
         # Pruning controls (stage-aware)
         # -------------------------------
-        if self.stage == "stage1":
+        if self.stage == "aux_pretrain":
             _default_window, _default_head, _default_tail = 12, 20, 15
+        elif self.stage == "task1_finetune":
+            _default_window, _default_head, _default_tail = 8, 12, 10
         else:
-            _default_window, _default_head, _default_tail = 3, 8, 6
+            _default_window, _default_head, _default_tail = 6, 10, 8
 
         # User overrides (<=0 means use default)
         self._prune_window_override = int(getattr(dataset_config, "prune_window", 0))
@@ -180,7 +191,7 @@ class VulnirLLMDataset(Dataset):
 
             # Auto-tune pruning window for stage1 if user didn't override
             # Heuristic: if most functions fit easily, we can afford larger windows.
-            if self.stage == "stage1" and self._prune_window_override <= 0:
+            if self.stage == "aux_pretrain" and self._prune_window_override <= 0:
                 if p90 <= int(self.max_total_tokens * 0.55):
                     self.prune_window = max(self.prune_window, 14)
                 elif p90 <= int(self.max_total_tokens * 0.75):
@@ -203,9 +214,40 @@ class VulnirLLMDataset(Dataset):
         label = "Vulnerable" if target == 1 else "Safe"
 
         # =======================
-        # Stage 1: Task A only
+        # Stage 1 (new aux_pretrain): Task B/C (Vulnir synthesis + Root cause)
+        # Legacy Stage 1 mapping (task1_finetune) handled below.
+        if self.stage == "aux_pretrain":
+            pick_c = random.random() < 0.5
+            if pick_c:
+                limit_c = self.max_total_tokens - self.prompt_lens["task_c"] - 256 - SAFETY_BUFFER
+                code_c = smart_code_pruning(
+                    raw_code,
+                    vulnir_ref,
+                    limit_c,
+                    self.tokenizer,
+                    window_size=self.prune_window,
+                    keep_head=self.prune_keep_head,
+                    keep_tail=self.prune_keep_tail,
+                )
+                vulnir_out = structured_ir_pruning(vulnir_ref, 256, self.tokenizer)
+                return self._pack("task_c", PROMPT_DICT["task_c"].format(input=code_c, vulnir=vulnir_ref), vulnir_out)
+            else:
+                limit_b = self.max_total_tokens - self.prompt_lens["task_b"] - 256 - SAFETY_BUFFER
+                code_b = smart_code_pruning(
+                    raw_code,
+                    vulnir_ref,
+                    limit_b,
+                    self.tokenizer,
+                    window_size=self.prune_window,
+                    keep_head=self.prune_keep_head,
+                    keep_tail=self.prune_keep_tail,
+                )
+                vulnir_out = structured_ir_pruning(vulnir_ref, 256, self.tokenizer)
+                return self._pack("task_b", PROMPT_DICT["task_b"].format(input=code_b), vulnir_out)
+
+        # Stage 2: Task A with CoT (Verdict + brief evidence)
         # =======================
-        if self.stage == "stage1":
+        if self.stage == "task1_finetune":
             limit_a = self.max_total_tokens - self.prompt_lens["task_a"] - self.label_budget_stage1 - SAFETY_BUFFER
             code_a = smart_code_pruning(
                 raw_code,
@@ -220,50 +262,11 @@ class VulnirLLMDataset(Dataset):
             return self._pack("task_a", prompt, label)
 
         # =======================
-        # Stage 2.1: Expert Mode
+        # Stage 3: Light joint finetune (Task A/B/C)
         # =======================
-        elif self.stage == "stage2_1":
-            # Decide tasks (B/C) etc. (keep original behavior)
-            # Here we keep your original logic; only pruning params are upgraded.
-            for _ in range(3):
-                pick_c = random.random() < 0.5
-                if pick_c:
-                    # Task C
-                    limit_c_code = self.max_total_tokens - self.prompt_lens["task_c"] - 256 - SAFETY_BUFFER
-                    code_c = smart_code_pruning(
-                        raw_code,
-                        vulnir_ref,
-                        limit_c_code,
-                        self.tokenizer,
-                        window_size=self.prune_window,
-                        keep_head=self.prune_keep_head,
-                        keep_tail=self.prune_keep_tail,
-                    )
-                    vulnir_out = structured_ir_pruning(vulnir_ref, 256, self.tokenizer)
-                    return self._pack("task_c", PROMPT_DICT["task_c"].format(input=code_c, vulnir=vulnir_ref), vulnir_out)
-                else:
-                    # Task B
-                    limit_b = self.max_total_tokens - self.prompt_lens["task_b"] - 256 - SAFETY_BUFFER
-                    code_b = smart_code_pruning(
-                        raw_code,
-                        vulnir_ref,
-                        limit_b,
-                        self.tokenizer,
-                        window_size=self.prune_window,
-                        keep_head=self.prune_keep_head,
-                        keep_tail=self.prune_keep_tail,
-                    )
-                    vulnir_out = structured_ir_pruning(vulnir_ref, 256, self.tokenizer)
-                    return self._pack("task_b", PROMPT_DICT["task_b"].format(input=code_b), vulnir_out)
-
-            return self._pack("task_a", PROMPT_DICT["task_a"].format(input=""), "Safe")
-
-        # =======================
-        # Stage 2.2: Fusion Mode
-        # =======================
-        elif self.stage == "stage2_2":
-            # Keep your original fusion behavior (task_a_cot + fused output)
-            for _ in range(3):
+        elif self.stage == "joint_finetune":
+            roll = random.random()
+            if roll < 0.34:
                 vulnir_str = vulnir_ref
                 fused_output = f"Analysis:\n{vulnir_str}\n\nVerdict: {label}"
 
@@ -283,8 +286,32 @@ class VulnirLLMDataset(Dataset):
                     PROMPT_DICT["task_a_cot"].format(input=code_a, vulnir=vulnir_str),
                     fused_output
                 )
-
-            return self._pack("task_a", PROMPT_DICT["task_a"].format(input=""), "Safe")
+            elif roll < 0.67:
+                limit_b = self.max_total_tokens - self.prompt_lens["task_b"] - 256 - SAFETY_BUFFER
+                code_b = smart_code_pruning(
+                    raw_code,
+                    vulnir_ref,
+                    limit_b,
+                    self.tokenizer,
+                    window_size=self.prune_window,
+                    keep_head=self.prune_keep_head,
+                    keep_tail=self.prune_keep_tail,
+                )
+                vulnir_out = structured_ir_pruning(vulnir_ref, 256, self.tokenizer)
+                return self._pack("task_b", PROMPT_DICT["task_b"].format(input=code_b), vulnir_out)
+            else:
+                limit_c_code = self.max_total_tokens - self.prompt_lens["task_c"] - 256 - SAFETY_BUFFER
+                code_c = smart_code_pruning(
+                    raw_code,
+                    vulnir_ref,
+                    limit_c_code,
+                    self.tokenizer,
+                    window_size=self.prune_window,
+                    keep_head=self.prune_keep_head,
+                    keep_tail=self.prune_keep_tail,
+                )
+                vulnir_out = structured_ir_pruning(vulnir_ref, 256, self.tokenizer)
+                return self._pack("task_c", PROMPT_DICT["task_c"].format(input=code_c, vulnir=vulnir_ref), vulnir_out)
 
         else:
             return self._pack("task_a", PROMPT_DICT["task_a"].format(input=""), "Safe")
